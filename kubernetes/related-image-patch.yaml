@@ -1,0 +1,20 @@
+# Rewrites the operator's RELATED_IMAGE_KEYCLOAK env var (used as the
+# fallback Keycloak server image when a Keycloak CR omits spec.image)
+# from quay.io to the upstream-mirror path in Artifact Registry.
+#
+# The kustomize `images:` directive in kustomization.yaml only rewrites
+# container image: fields, not arbitrary env values — this strategic
+# merge patch covers that gap so quay.io is never reached even if a
+# consumer creates a Keycloak CR without an explicit spec.image.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: keycloak-operator
+spec:
+  template:
+    spec:
+      containers:
+        - name: keycloak-operator
+          env:
+            - name: RELATED_IMAGE_KEYCLOAK
+              value: us-east4-docker.pkg.dev/skygpt-platform/skygpt-registry/upstream-mirror/images/keycloak:26.6.2
