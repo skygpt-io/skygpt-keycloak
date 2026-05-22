@@ -25,3 +25,16 @@ resources:
 images:
   - name: quay.io/keycloak/keycloak-operator
     newName: us-east4-docker.pkg.dev/skygpt-platform/skygpt-registry/upstream-mirror/images/keycloak-operator
+
+# Patch the operator's RELATED_IMAGE_KEYCLOAK env var (the fallback
+# Keycloak server image when a Keycloak CR omits spec.image) from
+# quay.io to the upstream-mirror path. Kustomize `images:` doesn't
+# rewrite env values, so this is required to keep that fallback path
+# inside Artifact Registry.
+patches:
+  - path: related-image-patch.yaml
+    target:
+      group: apps
+      version: v1
+      kind: Deployment
+      name: keycloak-operator
