@@ -1,0 +1,71 @@
+name: validate
+
+# Runs on every PR + every push to main. Confirms the vendored manifests
+# render via kustomize and pass kubeconform validation.
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+env:
+  KUSTOMIZE_VERSION: v5.7.1
+  KUBECONFORM_VERSION: v0.6.7
+  YAMLLINT_VERSION: 1.37.1
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install yamllint
+        env:
+          VERSION: ${{ env.YAMLLINT_VERSION }}
+        run: pip install --user "yamllint==${VERSION}"
+
+      - name: Install kustomize
+        env:
+          VERSION: ${{ env.KUSTOMIZE_VERSION }}
+        run: |
+          set -euo pipefail
+          curl -fsSL "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2F${VERSION}/kustomize_${VERSION}_linux_amd64.tar.gz" \
+            | tar -xz -C /usr/local/bin
+          kustomize version
+
+      - name: Install kubeconform
+        env:
+          VERSION: ${{ env.KUBECONFORM_VERSION }}
+        run: |
+          set -euo pipefail
+          curl -fsSL "https://github.com/yannh/kubeconform/releases/download/${VERSION}/kubeconform-linux-amd64.tar.gz" \
+            | tar -xz -C /usr/local/bin
+          kubeconform -v
+
+      - name: yamllint
+        run: |
+          set -euo pipefail
+          yamllint -d '{extends: default, rules: {line-length: disable, comments: disable, document-start: disable, truthy: disable, indentation: {indent-sequences: consistent}}}' \
+            .github/workflows kubernetes/
+
+      - name: kustomize build
+        run: |
+          set -euo pipefail
+          kustomize build --load-restrictor=LoadRestrictionsNone kubernetes/ > /tmp/rendered.yaml
+          wc -l /tmp/rendered.yaml
+
+      - name: kubeconform
+        run: |
+          set -euo pipefail
+          kubeconform \
+            -strict \
+            -ignore-missing-schemas \
+            -schema-location default \
+            -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' \
+            -skip CustomResourceDefinition,Keycloak,KeycloakRealmImport \
+            /tmp/rendered.yaml

@@ -1,0 +1,153 @@
+name: release-please
+
+# Two-pass execution (REQ-RELEASE-002, REQ-RELEASE-003):
+#
+#   1. On push to main, the bot computes the next semver from Conventional
+#      Commits since the last v* tag, then opens or updates a release PR.
+#   2. When the release PR merges, this same workflow re-runs, recognizes
+#      the merge pattern, and creates the v* git tag + GitHub Release.
+#      That tag push then triggers .github/workflows/release-oci.yaml
+#      (unchanged — REQ-COMPAT-001) which builds/pushes/cosign-signs the
+#      per-category OCI artifacts.
+#
+# Action pinned to commit SHA (REQ-SEC-001 supply-chain hygiene):
+#   googleapis/release-please-action v4.4.1
+#   published 2026-04-13, commit 5c625bfb5d1ff62eadeeb3772007f7f66fdcf071
+# To bump, look up a newer release at
+#   https://github.com/googleapis/release-please-action/releases
+# and update the SHA in the `uses:` line below + this comment.
+#
+# Permissions minimum-scope (REQ-SEC-001 / ADR-RELEASE-004):
+#   contents: write       — for creating tags + GitHub Releases
+#   pull-requests: write  — for opening/updating the release PR
+# No PAT, no external secrets, no shared workflow imports per ADR-0010.
+#
+# See:
+#   storage/specs/automated-releases-requirements.md
+#   storage/specs/automated-releases-design.md
+#   steering/memories/adrs/adr-release-001..004-*.md
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+  pull-requests: write
+
+env:
+  # Pinned to match validate.yaml + release-oci.yaml — keep in sync with .tool-versions.
+  KUSTOMIZE_VERSION: v5.7.1
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run release-please
+        id: release
+        uses: googleapis/release-please-action@5c625bfb5d1ff62eadeeb3772007f7f66fdcf071  # v4.4.1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+      # Install kustomize so scripts/list-active-categories.sh works in the
+      # consumer-signal step below. Same install pattern + version as
+      # validate.yaml / release-oci.yaml. Only needed when a release was
+      # actually created (otherwise the consumer-signal step is skipped).
+      - name: Install kustomize
+        if: ${{ steps.release.outputs.release_created == 'true' }}
+        env:
+          VERSION: ${{ env.KUSTOMIZE_VERSION }}
+        run: |
+          set -euo pipefail
+          curl -fsSL "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2F${VERSION}/kustomize_${VERSION}_linux_amd64.tar.gz" \
+            | tar -xz -C /usr/local/bin
+          kustomize version
+
+      # Append the "For consumers" section to the just-created GitHub
+      # Release body (REQ-RELEASE-013). Runs ONLY when this invocation
+      # actually created a release (i.e., the release PR was merged on
+      # this push). The section is auto-generated from
+      # scripts/list-active-categories.sh so adding a new top-level policy
+      # category automatically updates the consumer signal on the next
+      # release (REQ-MAINT-001 inheritance from per-category-bundles).
+      #
+      # Idempotency (REQ-RELEASE-012): the first echo'd line is a unique
+      # HTML-comment marker that the slice logic below uses to strip any
+      # previous section before appending. On a re-run (manual re-run,
+      # retry, transient-failure recovery) the body ends up with exactly
+      # one consumer-signal section, not duplicates.
+      - name: Append consumer signal to Release body
+        if: ${{ steps.release.outputs.release_created == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.release.outputs.tag_name }}
+        run: |
+          # shellcheck disable=SC2016 # the cosign subject regex is intentionally
+          # printed verbatim inside single quotes — no shell expansion wanted.
+          set -euo pipefail
+          MARKER="<!-- consumer-signal-marker -->"
+          mapfile -t cats < <(./scripts/list-active-categories.sh)
+          AR_BASE="us-east4-docker.pkg.dev/skygpt-platform/skygpt-registry"
+          {
+            echo "${MARKER}"
+            echo ""
+            echo "---"
+            echo ""
+            echo "### For consumers (skygpt-infra maintainers)"
+            echo ""
+            echo "Bump these \`OCIRepository.spec.ref.tag\` pins in"
+            echo "\`components/kyverno-policies/controllers/base/\`:"
+            echo ""
+            for cat in "${cats[@]}"; do
+              [ -z "$cat" ] && continue
+              echo "- \`${AR_BASE}/skygpt-policy-${cat}:${TAG}\`"
+            done
+            echo "- \`${AR_BASE}/skygpt-policy:${TAG}\` (legacy combined; sunset per ADR-BUNDLE-003)"
+            echo ""
+            echo "Cosign verify regex (unchanged across every per-category artifact — REQ-SEC-001):"
+            echo ""
+            echo '```'
+            echo '^https://github\.com/skygpt-io/skygpt-policy/\.github/workflows/release-oci\.yaml@refs/tags/v.*$'
+            echo '```'
+          } > /tmp/consumer-signal.md
+          # Re-run idempotency: strip everything from MARKER onwards before
+          # re-appending. On first run this is a no-op (MARKER not present).
+          # On subsequent runs (manual re-run, retry) this guarantees one
+          # and only one consumer-signal section in the Release body.
+          current=$(gh release view "${TAG}" --json body --jq .body)
+          # Quoting MARKER separately tells bash to treat it as a literal
+          # string in the parameter expansion, not a glob pattern (SC2295).
+          trimmed="${current%%"${MARKER}"*}"
+          # Drop a single trailing newline from the trimmed body so we don't
+          # accumulate blank lines on each re-run.
+          trimmed="${trimmed%$'\n'}"
+          {
+            printf '%s\n\n' "${trimmed}"
+            cat /tmp/consumer-signal.md
+          } | gh release edit "${TAG}" --notes-file -
+
+      # Operator visibility (REQ-RELEASE-015). Always runs so failure
+      # cases also produce a summary entry.
+      - name: Decision summary
+        if: always()
+        env:
+          OPENED: ${{ steps.release.outputs.pr_created || 'false' }}
+          PR_NUMBER: ${{ steps.release.outputs.pr_number || 'none' }}
+          TAGGED: ${{ steps.release.outputs.release_created || 'false' }}
+          TAG: ${{ steps.release.outputs.tag_name || 'none' }}
+        run: |
+          {
+            echo "## release-please decision"
+            echo ""
+            echo "- Opened/updated release PR: \`${OPENED}\` (#${PR_NUMBER})"
+            echo "- Created release tag: \`${TAGGED}\` (\`${TAG}\`)"
+            echo ""
+            echo "See \`.release-please-manifest.json\` for the bot's"
+            echo "current tracked version."
+          } >> "${GITHUB_STEP_SUMMARY}"

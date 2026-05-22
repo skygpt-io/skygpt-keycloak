@@ -1,0 +1,121 @@
+name: release-oci
+
+# Triggered on tag v*. Re-validates the bundle, then publishes ONE
+# signed OCI artifact:
+#
+#   us-east4-docker.pkg.dev/skygpt-platform/skygpt-registry/skygpt-keycloak:<tag>
+#
+# Auths to GCP via WIF (no static keys), using the same
+# skygpt-flux-publisher@skygpt-platform SA other producer repos
+# already use (skygpt-policy, skygpt-infra/components/*). Cosign-signs
+# the artifact digest with keyless OIDC; consumers verify with the
+# same subject regex pattern that skygpt-policy uses, scoped to this
+# repo:
+#
+#   ^https://github\.com/skygpt-io/skygpt-keycloak/\.github/workflows/release-oci\.yaml@refs/tags/v.*$
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  KUSTOMIZE_VERSION: v5.7.1
+  AR_HOST: us-east4-docker.pkg.dev
+  AR_BASE: us-east4-docker.pkg.dev/skygpt-platform/skygpt-registry
+  IMAGE_NAME: skygpt-keycloak
+  WIF_PROVIDER: projects/1033958667275/locations/global/workloadIdentityPools/github-actions/providers/github-publisher
+  WIF_SA: skygpt-flux-publisher@skygpt-platform.iam.gserviceaccount.com
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install kustomize
+        env:
+          VERSION: ${{ env.KUSTOMIZE_VERSION }}
+        run: |
+          set -euo pipefail
+          curl -fsSL "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2F${VERSION}/kustomize_${VERSION}_linux_amd64.tar.gz" \
+            | tar -xz -C /usr/local/bin
+
+      - name: Install flux
+        uses: controlplaneio-fluxcd/distribution/actions/setup@main
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v4.1.1
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ env.WIF_PROVIDER }}
+          service_account: ${{ env.WIF_SA }}
+
+      - name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure docker for Artifact Registry
+        env:
+          HOST: ${{ env.AR_HOST }}
+        run: gcloud auth configure-docker "${HOST}" --quiet
+
+      - name: kustomize render
+        run: |
+          set -euo pipefail
+          mkdir -p .rendered
+          kustomize build --load-restrictor=LoadRestrictionsNone kubernetes/ > .rendered/skygpt-keycloak.yaml
+          wc -l .rendered/skygpt-keycloak.yaml
+
+      - name: Push OCI artifact
+        env:
+          AR_BASE: ${{ env.AR_BASE }}
+          IMAGE_NAME: ${{ env.IMAGE_NAME }}
+          TAG: ${{ github.ref_name }}
+          REPO_URL: ${{ github.repositoryUrl }}
+          REVISION_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          url="${AR_BASE}/${IMAGE_NAME}:${TAG}"
+          echo "Pushing ${url}"
+          flux push artifact "oci://${url}" \
+            --path=kubernetes \
+            --source="${REPO_URL}" \
+            --revision="${TAG}@sha1:${REVISION_SHA}"
+
+      - name: Cosign-sign the artifact
+        env:
+          AR_BASE: ${{ env.AR_BASE }}
+          IMAGE_NAME: ${{ env.IMAGE_NAME }}
+          TAG: ${{ github.ref_name }}
+          COSIGN_EXPERIMENTAL: "1"
+        run: |
+          set -euo pipefail
+          ref="${AR_BASE}/${IMAGE_NAME}:${TAG}"
+          echo "Signing ${ref}"
+          cosign sign --yes "${ref}"
+
+      - name: Summary
+        env:
+          AR_BASE: ${{ env.AR_BASE }}
+          IMAGE_NAME: ${{ env.IMAGE_NAME }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          {
+            echo "## release-oci"
+            echo ""
+            echo "Published + signed:"
+            echo ""
+            echo "    ${AR_BASE}/${IMAGE_NAME}:${TAG}"
+            echo ""
+            echo "Consumers verify with cosign keyless OIDC, subject regex:"
+            echo ""
+            echo '    ^https://github\.com/skygpt-io/skygpt-keycloak/\.github/workflows/release-oci\.yaml@refs/tags/v.*$'
+          } >> "${GITHUB_STEP_SUMMARY}"
